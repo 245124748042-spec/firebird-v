@@ -1,0 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+body { @apply bg-base text-slate-800 font-sans antialiased; }
+button:focus-visible { @apply outline outline-2 outline-offset-2 outline-scan; }
+.fullscreen-panel:fullscreen canvas { height: calc(100vh - 170px); min-height: 500px; }
+.fullscreen-panel:fullscreen img { max-height: calc(100vh - 170px); }
