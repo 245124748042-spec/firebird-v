@@ -13,7 +13,7 @@ export default function Controls() {
         {TOOLS.map(([id, l]) => <Button key={id} active={w.tool === id} onClick={() => act(x => (x.tool = id))}>{l}</Button>)}
         <Button kind="danger" onClick={() => act(clearMap)}>Clear Map</Button>
       </div>
-      <p className="mt-2 text-xs text-slate-500">Pick a tool, then click a cell. Destination selection will be added in a later phase.</p>
+      <p className="mt-2 text-xs text-slate-500">Pick a tool, then click a cell. In Simulation mode, set the green source and red destination directly on the 3D route map.</p>
       <label className="mt-3 block text-sm text-slate-800">Grid size: <span className="font-mono">{w.size} x {w.size}</span>
         <input type="range" min={5} max={20} value={w.size} onChange={e => act(x => resizeWorld(x, +e.target.value))} className="mt-1 w-full" aria-label="Grid size" /></label>
     </Card>

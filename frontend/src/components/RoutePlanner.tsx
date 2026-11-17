@@ -1,16 +1,18 @@
-import { Pause, Play, Route as RouteIcon, Send, Square, OctagonAlert } from 'lucide-react'
+import { Pause, Play, Route as RouteIcon, Square, OctagonAlert, RotateCcw } from 'lucide-react'
 import { useDashboard } from '../hooks/useDashboard'
 import Button from './Button'
 import Card from './Card'
 import MetricTile from './MetricTile'
 import { Badge } from './Badge'
+import { cellName, parseCell } from '../lib/format'
+import { simulatedRoutePose, startFollow } from '../lib/simulation'
 
 export default function RoutePlanner() {
-  const { w, act, live, backend, calculate, sendRoute, planning, startNavigation, pauseNavigation, resumeNavigation, stopNavigation, emergencyStop, resetEmergencyStop } = useDashboard()
+  const { w, act, live, backend, speed, setSpeed, calculate, planning, startNavigation, pauseNavigation, resumeNavigation, stopNavigation, emergencyStop, resetEmergencyStop } = useDashboard()
   const r = w.route, extra = r.found ? r.path.length - 1 - r.shortestLength : 0
   const destinationAvailable = live ? !!(w.goal || backend.map?.goal || backend.status?.goal) : !!w.goal
   const piMode = !!backend.status?.raspberryPi?.enabled
-  const executor = backend.status?.route as { state?: string; index?: number; total?: number; nextCommand?: string; emergencyStopLatched?: boolean } | undefined
+  const executor = backend.status?.route as { state?: string; index?: number; total?: number; nextCommand?: string; emergencyStopLatched?: boolean; replanCount?: number } | undefined
   const executorState = executor?.state ?? 'IDLE'
   const emergencyStopLatched = !!executor?.emergencyStopLatched
   const telemetryFresh = backend.telemetryAt !== null && Date.now() - backend.telemetryAt < 1500
@@ -26,22 +28,33 @@ export default function RoutePlanner() {
   const navigationBlock = !live ? 'Waiting for fresh FireBird telemetry.'
     : !communicationReady ? (piMode ? 'Raspberry Pi bridge is unavailable.' : 'FireBird serial communication is unavailable.')
     : !telemetryFresh ? 'Telemetry is stale.'
-    : !calibrated ? 'Encoder odometry is not calibrated or has not produced a position yet.'
+    : !calibrated ? 'Encoder odometry is unavailable; live navigation requires measured wheel, encoder, and map-cell calibration.'
     : !sensorsReady ? 'Required environmental sensor health is unavailable.'
     : emergencyStopLatched ? 'Emergency stop is latched; reset it after confirming the rover is stopped and safe.'
     : !robotStopped ? 'FireBird reports movement in progress.'
     : hazardStop ? 'Obstacle or critical hazard stop is active.'
-    : ['FAILED', 'BLOCKED'].includes(executorState) ? 'Navigation is locked after a failure; use Emergency Stop and verify the rover.'
+    : executorState === 'BLOCKED' ? 'Destination blocked – Waiting for a safe path.'
+    : executorState === 'FAILED' ? 'Navigation is locked after a failure; use Emergency Stop and verify the rover.'
     : executorState === 'STOPPING' ? 'Waiting for the stop command acknowledgement.'
     : !r.found || r.planner !== 'backend' ? 'Calculate a backend route first.' : ''
   const navigating = executorState === 'FOLLOWING' || executorState === 'STOPPING'
+  const liveGoalCell = backend.map?.goal ? parseCell(backend.map.goal) : null
+  const remainingCells = backend.map && liveGoalCell
+    ? Math.abs(backend.map.rover.row - liveGoalCell.r) + Math.abs(backend.map.rover.column - liveGoalCell.c) : null
+  const simPose = simulatedRoutePose(w)
+  const simRouteLength = Math.max(0, w.route.path.length - 1)
+  const simProgress = Math.min(simRouteLength, w.simProgress)
+  const simPercent = simRouteLength ? Math.round(simProgress / simRouteLength * 100) : 0
+  const simPosition = `r ${(simPose.y - 0.5).toFixed(2)}, c ${(simPose.x - 0.5).toFixed(2)}`
+  const simStatus = !w.running ? 'SIMULATION PAUSED' : w.following ? (w.paused ? 'PAUSED' : 'MOVING') : r.found && simProgress >= simRouteLength ? 'DESTINATION REACHED' : r.found ? 'READY' : 'AWAITING ROUTE'
   const navStatus = planning ? 'Planning route'
     : executorState === 'COMPLETE' ? 'ARRIVED · Destination reached'
-    : executorState === 'FAILED' || executorState === 'BLOCKED' ? 'Navigation failed'
+    : executorState === 'BLOCKED' ? 'Destination blocked – Waiting for a safe path.'
+    : executorState === 'FAILED' ? 'Navigation failed'
     : executorState === 'PAUSED' ? 'PAUSED · Navigation paused'
     : executorState === 'STOPPING' ? 'STOPPING · waiting for Pi bridge acknowledgement'
     : executorState === 'IDLE' && (executor?.total ?? 0) > 0 ? 'Navigation stopped'
-    : navigating && backend.telemetry?.obstacleDetected ? 'Obstacle detected'
+    : navigating && backend.telemetry?.obstacleDetected ? 'Obstacle detected – Replanning route.'
     : navigating && backend.telemetry?.movement === 'F' ? 'Moving forward'
     : navigating && backend.telemetry?.movement === 'B' ? 'Moving backward'
     : navigating && backend.telemetry?.movement === 'L' ? 'Turning left'
@@ -68,16 +81,33 @@ export default function RoutePlanner() {
           <Button kind="danger" disabled={!backend.online} onClick={() => void emergencyStop()} title="Sends the existing MOVE:STOP command; not a separate hardware E-stop"><OctagonAlert size={14} />Emergency Stop</Button>
           {emergencyStopLatched && <Button disabled={!communicationReady || !telemetryFresh || !robotStopped || hazardStop || !sensorsReady} onClick={() => { if (window.confirm('Reset the software emergency stop latch? Confirm the rover is physically stopped and the area is safe.')) void resetEmergencyStop() }}>Reset Emergency Stop</Button>}
         </> : <>
-          <Button onClick={sendRoute} disabled={planning || !destinationAvailable}><Send size={14} />Follow Simulated Route</Button>
-          <Button disabled={!w.following || w.paused} onClick={() => act(x => { x.paused = true; x.outbox.push('MOVE:STOP') })}><Pause size={14} />Pause Simulation</Button>
-          <Button disabled={!w.following || !w.paused} onClick={() => act(x => (x.paused = false))}><Play size={14} />Resume Simulation</Button>
+          <Button kind="primary" disabled={!r.found || w.following} onClick={() => act(x => { x.mode = 'SIM'; x.running = true; startFollow(x) })}><Play size={14} />Start Simulation</Button>
+          <Button disabled={!w.following || w.paused} onClick={() => act(x => { x.paused = true })}><Pause size={14} />Pause Simulation</Button>
+          <Button disabled={!w.following || !w.paused} onClick={() => act(x => { x.running = true; x.paused = false })}><Play size={14} />Resume Simulation</Button>
+          <Button disabled={!r.found} onClick={() => act(x => { x.running = true; x.following = false; x.paused = false; x.simProgress = 0; x.qi = 0; x.rover = { ...x.start, h: 0 } })}><RotateCcw size={14} />Reset Simulation</Button>
+          <label className="flex min-w-40 items-center gap-2 rounded-md border border-line px-2 text-xs text-slate-700">Speed {speed.toFixed(1)}×<input aria-label="Simulation speed" type="range" min={0.5} max={2} step={0.1} value={speed} onChange={e => setSpeed(+e.target.value)} className="w-24" /></label>
         </>}
       </div>
       <div className="mb-3 flex flex-wrap items-center gap-2 text-sm">
         {!destinationAvailable ? <Badge>AWAITING DESTINATION</Badge> : r.planner === 'none' ? <Badge>NO ROUTE CALCULATED</Badge> : r.found ? <Badge kind="ok">ROUTE FOUND</Badge> : <Badge kind="crit">NO ROUTE FOUND</Badge>}
         <span className="text-slate-600">{live ? navStatus : w.following ? (w.paused ? 'Simulation route paused' : 'Following route (simulated rover).') : !destinationAvailable ? 'Select a destination to calculate a route.' : r.status}</span>
       </div>
+      {live && <p className="mb-3 rounded-md border border-sky-200 bg-sky-50 p-3 text-sm text-sky-900">LIVE HARDWARE MODE · the backend plans a safe route when you select a destination. Press Start Navigation to move the rover; encoder telemetry updates its position and route progress.</p>}
+      {!live && <p className="mb-3 rounded-md border border-line bg-base/60 p-3 text-sm text-slate-700">SIMULATION MODE · selecting a destination starts a 3D FireBird V route preview. This moves only the simulated rover.</p>}
+      {!live && <div className="mb-3 grid grid-cols-2 gap-2 rounded-md border border-line bg-base/60 p-3 text-sm sm:grid-cols-4">
+        <MetricTile label="Simulation status" value={simStatus} />
+        <MetricTile label="Current position" value={simPosition} sub={cellName(w.rover.r, w.rover.c)} />
+        <MetricTile label="Source → destination" value={`${cellName(w.start.r, w.start.c)} → ${w.goal ? cellName(w.goal.r, w.goal.c) : '—'}`} />
+        <MetricTile label="Route progress" value={`${simPercent}%`} sub={`${simProgress.toFixed(1)} cells traveled · ${Math.max(0, simRouteLength - simProgress).toFixed(1)} cells remaining`} />
+      </div>}
+      {live && !calibrated && <p className="mb-3 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">The displayed grid pose is not calibrated metric odometry. Navigation remains blocked until measured map-cell scale and encoder calibration are available.</p>}
       {live && !navigationReady && !navigating && <p className="mb-3 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">Navigation unavailable: {navigationBlock}</p>}
+      {live && <div className="mb-3 grid grid-cols-2 gap-2 rounded-md border border-line bg-base/60 p-3 text-sm sm:grid-cols-4">
+        <MetricTile label="Navigation" value={executorState} sub={(executor?.replanCount ?? 0) > 0 ? 'using replanned path' : 'planned path'} />
+        <MetricTile label="Route progress" value={`${executor?.index ?? 0}/${executor?.total ?? (r.path.length ? r.path.length - 1 : 0)}`} sub="confirmed route commands" />
+        <MetricTile label="Distance remaining" value={remainingCells ?? '—'} sub="Manhattan distance · map cells" />
+        <MetricTile label="Position / heading" value={backend.map ? cellName(backend.map.rover.row, backend.map.rover.column) : '—'} sub={backend.map?.rover.heading ?? 'Awaiting pose'} />
+      </div>}
       {live && <p className="mb-3 text-xs text-slate-500">Emergency Stop sends the existing C:S stop command through the active serial owner. The telemetry protocol has no separate emergency-stop status or hardware E-stop acknowledgement.</p>}
       {!destinationAvailable && <p className="mb-3 rounded-md border border-line bg-base/60 p-3 text-sm text-slate-700">{live ? 'Click a cell on the live route map to set the destination.' : 'Select the Goal tool and choose a map cell to set the destination.'}</p>}
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">

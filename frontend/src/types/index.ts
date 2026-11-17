@@ -14,7 +14,7 @@ export interface FireBirdTelemetry {
 export type RiskLevel = 'SAFE' | 'CAUTION' | 'WARNING' | 'CRITICAL'
 export interface MapCell {
   row: number; column: number; coordinate: string
-  isObstacle: boolean; isPerson: boolean; isFire: boolean
+  isObstacle: boolean; isSensorObstacle?: boolean; isPerson: boolean; isFire: boolean
   temperature: number | null; smoke: number | null
   riskScore: number; riskLevel: RiskLevel; lastUpdated: string
 }
@@ -56,7 +56,7 @@ export interface BackendStatus {
   goal?: string | null
   obstacleDetected: boolean
   fireRiskLevel: RiskLevel
-  route: { state?: string; running?: boolean; paused?: boolean; index?: number; total?: number; nextCommand?: string | null; goal?: string | null; emergencyStopLatched?: boolean }
+  route: { state?: string; running?: boolean; paused?: boolean; index?: number; total?: number; nextCommand?: string | null; goal?: string | null; emergencyStopLatched?: boolean; path?: string[]; originalPath?: string[]; replanCount?: number }
   dataSource: DataSource
 }
 export interface TelemetryResponse { latest: FireBirdTelemetry | null; raw: { timestamp: string; line: string }[] }
@@ -74,3 +74,4 @@ export type WsMessage =
   | { type: 'status'; data: BackendStatus }
   | { type: 'person'; data: PersonStatus }
   | { type: 'alert'; data: BackendAlert }
+  | { type: 'route'; data: BackendStatus['route'] }

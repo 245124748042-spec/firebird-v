@@ -14,7 +14,7 @@ export interface World {
   tick: number; running: boolean; speed: number; mode: 'LIVE' | 'SIM'; startedAt: number
   size: number; obs: boolean[][]; persons: Cell[]; hot: Hot[]; start: Cell; goal: Cell | null; rover: Cell & { h: number }
   alpha: number; tool: string; sel: Cell | null
-  route: RouteState; prev: Cell[] | null
+  route: RouteState; prev: Cell[] | null; simProgress: number
   following: boolean; paused: boolean; qi: number; awaiting: boolean; sentAt: number; obsUntil: number; slow: boolean; needsReplan: boolean; mv: Movement
   tel: FireBirdTelemetry; lastTelAt: number; prevObs: boolean; telLog: { t: number; src: string; raw: string }[]; lastLiveT: number
   events: EventRec[]; eid: number; outbox: string[]
@@ -34,7 +34,7 @@ export function createWorld(size = 10): World {
   const w: World = {
     tick: 0, running: true, speed: 1, mode: 'SIM', startedAt: now, size, obs, persons: [], hot: [],
     start: { r: size - 1, c: 0 }, goal: null, rover: { r: size - 1, c: 0, h: 0 },
-    alpha: 1.5, tool: 'select', sel: null, route: { ...emptyRoute }, prev: null,
+    alpha: 1.5, tool: 'select', sel: null, route: { ...emptyRoute }, prev: null, simProgress: 0,
     following: false, paused: false, qi: 0, awaiting: false, sentAt: 0, obsUntil: 0, slow: false, needsReplan: false, mv: 'S',
     tel: { leftIr: 100, centerIr: 100, rightIr: 100, sideIr: 100, temperatureTenths: 280, humidityTenths: 450, smokeValue: 120, obstacleDetected: false, movement: 'S', riskScore: 0, personCount: 0, timestamp: new Date(now).toISOString(), source: 'SIMULATED' },
     lastTelAt: 0, prevObs: false, telLog: [], lastLiveT: 0, events: [], eid: 0, outbox: [],
@@ -53,13 +53,13 @@ export function resizeWorld(w: World, size: number) {
   w.start = inb(w.start) ? w.start : { r: size - 1, c: 0 }
   w.goal = w.goal && inb(w.goal) ? w.goal : null
   w.rover = { ...w.start, h: 0 }; w.sel = null
-  w.route = { ...emptyRoute, alpha: w.alpha }; w.prev = null; w.following = false; w.paused = false
+  w.route = { ...emptyRoute, alpha: w.alpha }; w.prev = null; w.following = false; w.paused = false; w.simProgress = 0
   log(w, 'System', `Grid resized to ${size} x ${size}`, 'Info')
 }
 
 export function clearMap(w: World) {
   w.obs = grid(w.size, false); w.persons = []; w.hot = []; w.scenario = 'normal'
-  w.route = { ...emptyRoute, alpha: w.alpha }; w.prev = null; w.following = false; w.paused = false; w.sel = null
+  w.route = { ...emptyRoute, alpha: w.alpha }; w.prev = null; w.following = false; w.paused = false; w.sel = null; w.simProgress = 0
   log(w, 'System', 'Map cleared', 'Info')
 }
 
@@ -102,6 +102,7 @@ export function editCell(w: World, c: Cell) {
   }
   w.cellUpdated[k] = Date.now()
   if (w.tool !== 'person') { w.route = { ...emptyRoute, alpha: w.alpha }; w.following = false; w.paused = false }
+  if (w.tool === 'start') w.simProgress = 0
 }
 
 export function setScenario(w: World, s: Scenario) {
@@ -152,7 +153,7 @@ export function routeFromResponse(w: World, r: RouteResponse, grid?: { rows: num
 
 export function applyRoute(w: World, rs: RouteState) {
   if (w.route.found) w.prev = w.route.path
-  w.route = rs; w.qi = 0
+  w.route = rs; w.qi = 0; w.simProgress = 0
   if (rs.found) {
     const names = rs.path.map(p => cellName(p.r, p.c))
     const shown = names.length > 5 ? [...names.slice(0, 3), '...', names[names.length - 1]] : names
@@ -163,6 +164,11 @@ export function applyRoute(w: World, rs: RouteState) {
 export function startFollow(w: World) {
   if (!w.route.found) return
   w.following = true; w.paused = false; w.awaiting = false; w.qi = 0; w.stoppedByPerson = false
+  if (w.mode === 'SIM') {
+    w.simProgress = 0
+    const routeStart = w.route.path[0] ?? w.rover
+    w.rover = { ...routeStart, h: w.rover.h }
+  }
   log(w, 'Path', w.mode === 'LIVE' ? 'Route following started (commands sent through backend)' : 'Route following started (simulated)', 'Info', w.goal ?? undefined)
 }
 
@@ -192,12 +198,58 @@ function obstacleHit(w: World) {
   log(w, 'Obstacle', 'Obstacle detected. Route paused. Replanning required.', 'Warning', c, 'Replanning route')
 }
 
-function simStep(w: World) {
-  const cmd = w.route.cmds[w.qi]
-  if (!cmd) { w.following = false; return }
-  if (applyCmd(w, cmd) === 'blocked') return obstacleHit(w)
-  w.qi++; w.mv = MOVE_FROM_CMD[cmd] ?? 'S'
-  if (cmd === 'MOVE:STOP') { w.following = false; log(w, 'Path', 'Goal reached', 'Info', w.rover) }
+/** Advance the simulated rover along the planner's cell path, including turns. */
+export function advanceSimulationRoute(w: World) {
+  const path = w.route.path
+  if (!w.route.found || path.length < 1) { w.following = false; return }
+  if (path.length === 1) {
+    w.rover = { ...path[0], h: w.rover.h }; w.following = false; w.paused = false
+    log(w, 'Path', 'Simulation reached the destination', 'Info', w.rover)
+    return
+  }
+  const total = path.length - 1
+  const nextProgress = Math.min(total, w.simProgress + 0.12)
+  const nextIndex = Math.min(Math.floor(nextProgress + 1e-9), total)
+  const nextCell = path[nextIndex]
+  if (w.obs[nextCell.r]?.[nextCell.c]) {
+    w.following = false; w.paused = true; w.needsReplan = true
+    log(w, 'Obstacle', 'A route cell became blocked. Simulation paused for replanning.', 'Warning', nextCell, 'Replanning route')
+    return
+  }
+  w.simProgress = nextProgress
+  const cellIndex = Math.min(Math.floor(nextProgress), total)
+  const cell = path[cellIndex]
+  w.rover.r = cell.r; w.rover.c = cell.c
+  const segmentIndex = Math.min(Math.floor(nextProgress), total - 1)
+  const a = path[segmentIndex], b = path[segmentIndex + 1]
+  const dr = b.r - a.r, dc = b.c - a.c
+  w.rover.h = dr < 0 ? 0 : dc > 0 ? 1 : dr > 0 ? 2 : 3
+  w.mv = 'F'
+  if (nextProgress >= total) {
+    w.simProgress = total; w.rover = { r: path[total].r, c: path[total].c, h: w.rover.h }
+    w.following = false; w.paused = false; w.mv = 'S'
+    log(w, 'Path', 'Simulation reached the destination', 'Info', w.rover)
+  }
+}
+
+/** Continuous map-space pose used only for simulated rendering and status. */
+export function simulatedRoutePose(w: World) {
+  const path = w.route.path
+  if (w.mode !== 'SIM' || !w.route.found || path.length < 2) {
+    return { x: w.rover.c + 0.5, y: w.rover.r + 0.5, heading: w.rover.h * Math.PI / 2 - Math.PI / 2 }
+  }
+  const total = path.length - 1, progress = Math.max(0, Math.min(total, w.simProgress))
+  const index = Math.min(Math.floor(progress), total - 1), t = progress >= total ? 1 : progress - index
+  const a = path[index], b = path[index + 1]
+  let heading = Math.atan2(b.r - a.r, b.c - a.c)
+  if (index > 0 && t < 0.2) {
+    const before = path[index - 1], prior = Math.atan2(a.r - before.r, a.c - before.c)
+    const delta = ((heading - prior + Math.PI * 3) % (Math.PI * 2)) - Math.PI
+    const blend = Math.max(0, Math.min(1, t / 0.2))
+    heading = prior + delta * blend
+  }
+  return { x: a.c + 0.5 + (b.c - a.c) * t, y: a.r + 0.5 + (b.r - a.r) * t,
+    heading }
 }
 
 function liveStep(w: World) {
@@ -257,7 +309,7 @@ export function tickSim(w: World) {
   w.tick++
   if (w.mode === 'SIM') {
     if (w.tick % 25 === 0) w.battery = Math.max(5, w.battery - 0.1)
-    if (w.following && !w.paused && w.tick % (w.slow ? 6 : 3) === 0) simStep(w)
+    if (w.following && !w.paused && (!w.slow || w.tick % 6 === 0)) advanceSimulationRoute(w)
     if (!w.following) w.mv = 'S'
     w.tel = simTel(w)
     if (w.tick % 5 === 0) { w.telLog.unshift({ t: Date.now(), src: 'SIMULATED', raw: rawLine(w.tel) }); if (w.telLog.length > 80) w.telLog.length = 80 }

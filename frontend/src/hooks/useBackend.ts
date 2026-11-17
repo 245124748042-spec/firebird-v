@@ -63,6 +63,7 @@ export function useBackend(): BackendState {
             else if (m.type === 'map') patch({ map: m.data })
             else if (m.type === 'status') patch({ online: true, status: m.data })
             else if (m.type === 'person') patch({ person: m.data })
+            else if (m.type === 'route') setS(prev => ({ ...prev, status: prev.status ? { ...prev.status, route: m.data } : prev.status }))
             else if (m.type === 'alert') setS(prev => ({ ...prev, alerts: [m.data, ...prev.alerts.filter(a => a.id !== m.data.id)].slice(0, 100) }))
           } catch { /* ignore malformed message */ }
         }

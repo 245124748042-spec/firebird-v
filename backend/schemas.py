@@ -58,6 +58,7 @@ class MapCell(CamelModel):
     column: int
     coordinate: str
     is_obstacle: bool
+    is_sensor_obstacle: bool = False
     is_person: bool
     is_fire: bool
     temperature: Optional[float] = None

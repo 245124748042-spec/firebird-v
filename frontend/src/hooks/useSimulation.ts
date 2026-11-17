@@ -1,6 +1,6 @@
 import { MutableRefObject, useEffect, useRef, useState } from 'react'
 import { api } from '../lib/api'
-import { createWorld, log, tickSim, World } from '../lib/simulation'
+import { advanceSimulationRoute, createWorld, log, tickSim, World } from '../lib/simulation'
 import { isLive, BackendState } from './useBackend'
 
 /** Owns the world object and runs the 200 ms loop while the dashboard is open. */
@@ -30,6 +30,7 @@ export function useSimulation(active: boolean, backendRef: MutableRefObject<Back
       }
       if (retainPiReadings) {
         w.personCount = b.person?.count ?? b.status?.raspberryPi?.personCount ?? w.tel.personCount
+        if (w.mode === 'SIM' && w.running && w.following && !w.paused) advanceSimulationRoute(w)
         bump()
         return
       }

@@ -2,7 +2,7 @@ import { MutableRefObject, useRef, useState } from 'react'
 import { api } from '../lib/api'
 import { applyRoute, buildRouteRequest, log, planLocalFor, routeFromResponse, startFollow, World } from '../lib/simulation'
 import { cellName } from '../lib/format'
-import type { BackendState } from './useBackend'
+import { isLive, type BackendState } from './useBackend'
 import type { RouteState } from '../types'
 import type { Cell } from '../types'
 
@@ -51,8 +51,13 @@ export function useRoutePlanner(w: World, act: (f: (w: World) => void) => void, 
   const setDestination = async (cell: Cell) => {
     const requestId = ++destinationRequestId.current
     const b = backendRef.current
-    if (b.status?.mode !== 'LIVE' || !b.map) {
-      act(x => { x.goal = cell; x.route = { ...x.route, found: false, path: [], cmds: [], planner: 'none', status: 'Destination selected; calculate a route' } })
+    if (!isLive(b) || !b.map) {
+      act(x => { x.goal = cell; x.route = { ...x.route, found: false, path: [], cmds: [], planner: 'none', status: 'Planning simulation route' }; x.following = false; x.paused = false; x.simProgress = 0 })
+      const result = planLocalFor({ ...w, goal: cell })
+      if (requestId === destinationRequestId.current) act(x => {
+        applyRoute(x, result)
+        if (result.found) startFollow(x)
+      })
       return
     }
     act(x => { x.goal = cell; x.route = { ...x.route, found: false, path: [], cmds: [], planner: 'none', status: 'Calculating route' } })
@@ -66,13 +71,6 @@ export function useRoutePlanner(w: World, act: (f: (w: World) => void) => void, 
       if (requestId !== destinationRequestId.current) return
       const result = routeFromResponse({ ...w, goal: cell }, response, { rows: b.map.rows, columns: b.map.columns })
       act(x => applyRoute(x, result))
-      if (result.found) {
-        try { await api.routeControl('start') }
-        catch (e) {
-          const reason = (e as Error).message
-          act(x => { x.route = { ...x.route, status: `Route ready; automatic navigation not started: ${reason}` } })
-        }
-      }
     } catch (e) {
       if (requestId === destinationRequestId.current) {
         act(x => { x.route = { ...x.route, found: false, path: [], cmds: [], planner: 'none', status: `Route failed: ${(e as Error).message}` } })

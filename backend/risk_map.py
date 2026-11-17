@@ -94,6 +94,7 @@ class RiskMap:
         self.cols = cols or settings.map_columns
         self.obstacles: set[tuple[int, int]] = set()
         self.sensor_obstacles: set[tuple[int, int]] = set()
+        self.latched_sensor_obstacles: set[tuple[int, int]] = set()
         self.sources: list[Source] = []
         self.measured: dict[tuple[int, int], tuple[float, float]] = {}
         self.reported_risk: dict[tuple[int, int], tuple[float, float]] = {}
@@ -130,6 +131,7 @@ class RiskMap:
             inb = lambda r, c: self.in_bounds(r, c)  # noqa: E731
             self.obstacles = {(r, c) for r, c in self.obstacles if inb(r, c)}
             self.sensor_obstacles = {(r, c) for r, c in self.sensor_obstacles if inb(r, c)}
+            self.latched_sensor_obstacles = {(r, c) for r, c in self.latched_sensor_obstacles if inb(r, c)}
             self.sources = [s for s in self.sources if inb(s.row, s.col)]
             self.measured = {k: v for k, v in self.measured.items() if inb(*k)}
             self.reported_risk = {k: v for k, v in self.reported_risk.items() if inb(*k)}
@@ -142,7 +144,7 @@ class RiskMap:
 
     def clear(self) -> None:
         with self._lock:
-            self.obstacles.clear(); self.sensor_obstacles.clear(); self.sources.clear(); self.measured.clear(); self.reported_risk.clear(); self.touched.clear()
+            self.obstacles.clear(); self.sensor_obstacles.clear(); self.latched_sensor_obstacles.clear(); self.sources.clear(); self.measured.clear(); self.reported_risk.clear(); self.touched.clear()
             self._bump()
 
     def set_goal(self, row: int, col: int) -> None:
@@ -162,16 +164,33 @@ class RiskMap:
             self.obstacles.add((r, c)); self._bump((r, c))
 
     def set_sensor_obstacle(self, r: int, c: int, detected: bool) -> None:
-        """Track the currently reported forward IR obstacle without making it permanent."""
+        """Track a forward IR obstacle until telemetry confirms the path is clear."""
         with self._lock:
             if not self.in_bounds(r, c):
                 return
             cell = (r, c)
-            previous = set(self.sensor_obstacles)
-            self.sensor_obstacles.clear()
             if detected:
+                previous = set(self.sensor_obstacles)
+                self.sensor_obstacles.clear()
                 self.sensor_obstacles.add(cell)
-            self._bump(*(previous | {cell}))
+                self._bump(*(previous | {cell}))
+            elif self.sensor_obstacles:
+                previous = set(self.sensor_obstacles)
+                self.sensor_obstacles.clear()
+                self._bump(*previous)
+
+    def clear_sensor_obstacles(self) -> None:
+        with self._lock:
+            if self.sensor_obstacles or self.latched_sensor_obstacles:
+                previous = set(self.sensor_obstacles) | set(self.latched_sensor_obstacles)
+                self.sensor_obstacles.clear(); self.latched_sensor_obstacles.clear()
+                self._bump(*previous)
+
+    def latch_sensor_obstacle(self, r: int, c: int) -> None:
+        with self._lock:
+            if self.in_bounds(r, c):
+                self.latched_sensor_obstacles.add((r, c))
+                self._bump((r, c))
 
     def apply_action(self, r: int, c: int, action: str) -> str:
         """Apply one of the dashboard cell actions. Returns a short description."""
@@ -341,7 +360,7 @@ class RiskMap:
         def spread(arr: np.ndarray, r: int, c: int, v: float, k: float) -> None:
             np.maximum(arr, v * np.exp(-k * np.hypot(rr - r, cc - c)), out=arr)
 
-        obstacles = set(self.obstacles) | set(self.sensor_obstacles) | (overlay.obstacles if overlay else set())
+        obstacles = set(self.obstacles) | set(self.sensor_obstacles) | set(self.latched_sensor_obstacles) | (overlay.obstacles if overlay else set())
         for r, c in obstacles:
             spread(obs, r, c, 1.0, s.risk_spread_k_obstacle)
         srcs = [(x.kind, x.row, x.col, x.intensity, x.fire) for x in self.sources]
@@ -419,7 +438,8 @@ class RiskMap:
                 temp = round(27.0 + 50.0 * float(d["th"][r, c]), 1)
                 smoke = round(self.s.smoke_baseline + float(d["sm"][r, c]) * (self.s.smoke_high - self.s.smoke_baseline), 0)
             return MapCell(
-                row=r, column=c, coordinate=coordinate(r, c), is_obstacle=(r, c) in self.obstacles or (r, c) in self.sensor_obstacles,
+                row=r, column=c, coordinate=coordinate(r, c), is_obstacle=(r, c) in self.obstacles or (r, c) in self.sensor_obstacles or (r, c) in self.latched_sensor_obstacles,
+                is_sensor_obstacle=(r, c) in self.sensor_obstacles or (r, c) in self.latched_sensor_obstacles,
                 is_person=(r, c) in d["persons"], is_fire=((r, c) in d["fire"]) or float(d["th"][r, c]) >= 0.7 and any(
                     x.kind == "thermal" and (x.row, x.col) == (r, c) for x in self.sources),
                 temperature=temp, smoke=smoke, risk_score=round(score, 1), risk_level=risk_level(score),

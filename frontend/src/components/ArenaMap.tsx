@@ -28,6 +28,7 @@ export default function ArenaMap({ interactive = true, title = 'Risk map' }: { i
     ? Array.from({ length: n }, (_, r) => Array.from({ length: n }, (_, c) => backendCells[r * n + c]?.riskScore ?? 0))
     : riskOf(w)
   const isObstacle = (r: number, c: number) => backendCells ? !!backendCells[r * n + c]?.isObstacle : w.obs[r][c]
+  const isSensorObstacle = (r: number, c: number) => !!backendCells?.[r * n + c]?.isSensorObstacle
   const ctr = (c: Cell) => `${c.c + 0.5},${c.r + 0.5}`
   const pts = (p: Cell[]) => p.map(ctr).join(' ')
   const rover = live && backend.map ? { r: backend.map.rover.row, c: backend.map.rover.column, h: ['N', 'E', 'S', 'W'].indexOf(backend.map.rover.heading) } : w.rover
@@ -46,7 +47,7 @@ export default function ArenaMap({ interactive = true, title = 'Risk map' }: { i
       <svg viewBox={viewBox} className="mx-auto aspect-square w-full max-w-[480px] rounded border border-line bg-white" role="img" aria-label="Rover centered on a compact local map showing hazards, actual travelled trail and planned route">
         <rect x={roverPoint.x - viewRadius} y={roverPoint.y - viewRadius} width={viewRadius * 2} height={viewRadius * 2} fill="#fff" />
         {risk.map((row, r) => row.map((v, c) => (
-          <rect key={`${r}-${c}`} x={c} y={r} width={1} height={1} stroke="#fff" strokeWidth={0.018} fill={isObstacle(r, c) ? '#94a3b8' : FILL[levelFromScore(v)]}
+          <rect key={`${r}-${c}`} x={c} y={r} width={1} height={1} stroke="#fff" strokeWidth={0.018} fill={isSensorObstacle(r, c) ? '#ef4444' : isObstacle(r, c) ? '#94a3b8' : FILL[levelFromScore(v)]}
             onClick={interactive ? () => click({ r, c }) : undefined} style={{ cursor: interactive ? 'pointer' : 'default' }}><title>{cellName(r, c)}</title></rect>
         )))}
         {!live && w.prev && w.prev.length > 1 && <polyline points={pts(w.prev)} fill="none" stroke="#64748b" strokeWidth={0.025} strokeDasharray="0.12 0.1" />}

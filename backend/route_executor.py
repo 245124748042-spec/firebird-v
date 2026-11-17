@@ -68,6 +68,8 @@ class RouteExecutor:
         self.map, self.s, self.tracker, self._send, self._tel, self.alerts, self._changed = risk_map, settings, tracker, send, telemetry, alerts, changed
         self._safety_check = safety_check or (lambda: None)
         self.route: Optional[PlannedRoute] = None
+        self.original_route: Optional[PlannedRoute] = None
+        self.replan_count = 0
         self.goal: Optional[tuple[int, int]] = None
         self.alpha, self.risk_aware = 1.5, True
         self.idx = 0
@@ -92,7 +94,8 @@ class RouteExecutor:
         self._changed()
 
     def start(self, route: PlannedRoute, goal: tuple[int, int], alpha: float, risk_aware: bool) -> None:
-        self.route, self.goal, self.alpha, self.risk_aware = route, goal, alpha, risk_aware
+        self.route, self.original_route, self.goal, self.alpha, self.risk_aware = route, route, goal, alpha, risk_aware
+        self.replan_count = 0
         self.idx, self.running, self.paused, self._awaiting, self._obs_wait = 0, True, False, False, None
         p = self.map.pose
         self._expected_pose = (p.row, p.col, p.heading)
@@ -220,13 +223,14 @@ class RouteExecutor:
         route = plan_route(grid, (p.row, p.col), self.goal, p.heading, self.alpha, self.risk_aware, self.s.risk_cost_scale)
         if route.found:
             self.route, self.idx, self.paused, self._awaiting = route, 0, False, False
+            self.replan_count += 1
             self._expected_pose = (p.row, p.col, p.heading)
             self._set("FOLLOWING")
             self.alerts.add("INFO", "PATH", f"Route replanned: {len(route.commands) - 1} moves, risk {route.total_risk}", coordinate(*self.goal), dedupe_s=0)
             return True
         self.running = self.paused = False
         self._set("BLOCKED")
-        self.alerts.add("CRITICAL", "PATH", "Route blocked. No safe route found.", coordinate(*self.goal), "Change goal or clear blocked cells", dedupe_s=0)
+        self.alerts.add("CRITICAL", "PATH", "Destination blocked – Waiting for a safe path.", coordinate(*self.goal), "Keep the rover stopped and clear the obstacle", dedupe_s=0)
         return False
 
     def _advance_expected_pose(self, cmd: str) -> None:
@@ -247,7 +251,8 @@ class RouteExecutor:
         """FireBird reported OBS:1. Mark the cell ahead as blocked, pause, then replan."""
         r, c = self.map.cell_ahead()
         if self.map.in_bounds(r, c):
-            self.map.add_obstacle(r, c)
+            self.map.set_sensor_obstacle(r, c, True)
+            self.map.latch_sensor_obstacle(r, c)
         where = coordinate(r, c) if self.map.in_bounds(r, c) else "-"
         ok, msg = self._send("MOVE:STOP")
         if self.running:
@@ -257,19 +262,22 @@ class RouteExecutor:
                 self.alerts.add("CRITICAL", "PATH", f"Obstacle stop failed: {msg}", where, "Restore communication and verify the rover is stopped", dedupe_s=0)
                 return
             self.paused = True
-            self.alerts.add("WARNING", "OBSTACLE", "Obstacle detected. Route paused. Replanning required.", where, "Replanning route", dedupe_s=1)
+            self.alerts.add("WARNING", "OBSTACLE", "Obstacle detected – Replanning route.", where, "Stopped; finding a safe route", dedupe_s=0)
             if self._wait_for_pi_stop(msg, "REPLAN"):
                 self._set("STOPPING")
                 return
             self.replan()
         else:
-            self.alerts.add("WARNING", "OBSTACLE", "Obstacle detected ahead. Cell marked as blocked.", where, "Choose another direction", dedupe_s=3)
+            self.alerts.add("WARNING", "OBSTACLE", "Obstacle detected – Replanning route.", where, "Choose another direction", dedupe_s=0)
 
     # ------------------------------------------------------------ loop
     def status(self) -> dict:
         n = len(self.route.commands) if self.route else 0
         return {"state": self.state, "running": self.running, "paused": self.paused, "index": self.idx, "total": n,
                 "goal": coordinate(*self.goal) if self.goal else None, "alpha": self.alpha, "riskAware": self.risk_aware,
+                "path": self.route.cells if self.route else [],
+                "originalPath": self.original_route.cells if self.original_route else [],
+                "replanCount": self.replan_count,
                 "nextCommand": self.route.commands[self.idx] if self.route and self.idx < n else None, "version": self.version}
 
     def tick(self) -> None:

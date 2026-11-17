@@ -97,12 +97,15 @@ class Context:
         self._pi_command_id = 0
         self._pi_pending_command: Optional[dict[str, Any]] = None
         self._pi_dispatch_pending: dict[int, dict[str, Any]] = {}
+        self._pi_superseded_commands: set[int] = set()
         self._pi_failure_recovery_command_id: Optional[int] = None
         self.raw_log: deque[dict] = deque(maxlen=80)
         self.mode_now = "SIMULATION"
         self.last_route: Optional[PlannedRoute] = None
         self.last_goal: Optional[tuple[int, int]] = None
         self._prev_obs = False
+        self._obstacle_clear_samples = 0
+        self._retry_blocked_after_obstacle = False
         self._prev_robot_flags = 0
         self._last_map_version = -1
         self._last_exec_version = -1
@@ -204,7 +207,7 @@ class Context:
         cell = ahead if self.map.in_bounds(*ahead) else None
         self.map.set_camera_presence(count > 0, cell)
 
-    def navigation_block_reason(self, *, check_start: bool = True) -> Optional[str]:
+    def navigation_block_reason(self, *, check_start: bool = True, allow_obstacle_escape: bool = False) -> Optional[str]:
         """Fail closed unless the selected serial owner has fresh calibrated feedback."""
         if self.emergency_stop_latched:
             return "Emergency stop is latched; explicitly reset it after checking the rover"
@@ -219,6 +222,7 @@ class Context:
                                if time.monotonic() - item["created"] > 1.5]
                 for command_id in expired_ids:
                     self._pi_dispatch_pending.pop(command_id, None)
+                    self._pi_superseded_commands.discard(command_id)
             if expired_ids:
                 return "Raspberry Pi did not acknowledge a movement command"
         else:
@@ -239,8 +243,10 @@ class Context:
             return "Required environmental sensor health is unavailable"
         if check_start and tel.movement != "S":
             return "FireBird reports movement in progress; wait until it is stopped before starting navigation"
-        if check_start and tel.obstacle_detected:
+        if tel.obstacle_detected and not allow_obstacle_escape:
             return "Obstacle is currently detected"
+        if self.person_count() > 0 and self.vision.safety_action == "stop":
+            return "Person detected; movement is blocked by the active person safety action"
         p = self.map.pose
         critical_environment = (tel.temperature_tenths / 10.0 >= 55.0 or tel.smoke_value >= self.settings.smoke_high)
         if tel.risk_score >= 75 or self.map.sample(p.row, p.col)["score"] >= 75 or tel.flags & 0x07 or critical_environment:
@@ -252,8 +258,15 @@ class Context:
         with self._pi_command_lock:
             if self._pi_pending_command is not None and command != "MOVE:STOP":
                 return False, "A Raspberry Pi serial command is already awaiting dispatch."
-            if self._pi_pending_command is not None and command == "MOVE:STOP":
-                self._pi_dispatch_pending.pop(self._pi_pending_command["commandId"], None)
+            if command == "MOVE:STOP":
+                # Retire every outstanding movement before publishing STOP. If the
+                # Pi already claimed one, its later ack must be rejected so the Pi
+                # immediately issues its local best-effort C:S and then polls STOP.
+                for command_id, item in list(self._pi_dispatch_pending.items()):
+                    if item["command"] != "MOVE:STOP":
+                        self._pi_superseded_commands.add(command_id)
+                        if self._pi_pending_command and self._pi_pending_command["commandId"] == command_id:
+                            self._pi_pending_command = None
             self._pi_command_id += 1
             item = {"commandId": self._pi_command_id, "command": command, "created": time.monotonic()}
             self._pi_pending_command = item
@@ -267,14 +280,15 @@ class Context:
             item = self._pi_pending_command
             if item is None:
                 return None
-            if time.monotonic() - item["created"] > 1.0:
+            if item["command"] != "MOVE:STOP" and time.monotonic() - item["created"] > 1.0:
                 self._pi_pending_command = None
                 self._pi_dispatch_pending.pop(item["commandId"], None)
                 expired = True
             else:
                 self._pi_pending_command = None
+                age_ms = 0 if item["command"] == "MOVE:STOP" else int((time.monotonic() - item["created"]) * 1000)
                 result = {"commandId": item["commandId"], "command": item["command"],
-                          "ageMs": int((time.monotonic() - item["created"]) * 1000), "ttlMs": 1000}
+                          "ageMs": age_ms, "ttlMs": 1000}
         if expired:
             if self.executor.running:
                 self.executor.pause("Pi command expired before serial dispatch")
@@ -283,6 +297,10 @@ class Context:
 
     def acknowledge_pi_command(self, command_id: int, accepted: bool, error: Optional[str]) -> bool:
         with self._pi_command_lock:
+            if command_id in self._pi_superseded_commands:
+                self._pi_superseded_commands.discard(command_id)
+                self._pi_dispatch_pending.pop(command_id, None)
+                return False
             item = self._pi_dispatch_pending.pop(command_id, None)
         if item is None:
             return False
@@ -348,6 +366,14 @@ class Context:
             ahead = self.map.cell_ahead()
             if self.map.in_bounds(*ahead):
                 self.map.set_sensor_obstacle(*ahead, tel.obstacle_detected)
+            if tel.obstacle_detected:
+                self.map.latch_sensor_obstacle(*ahead)
+                self._obstacle_clear_samples = 0
+                self._retry_blocked_after_obstacle = True
+            else:
+                self._obstacle_clear_samples += 1
+                if self._obstacle_clear_samples >= 5:
+                    self.map.clear_sensor_obstacles()
             if previous_cost is not None and self.executor.running:
                 current_cost = self.map.cost_grid()
                 material_change = (np.max(np.abs(current_cost.risk01 - previous_cost.risk01)) >= 0.15
@@ -358,6 +384,11 @@ class Context:
         if tel.obstacle_detected and not self._prev_obs:
             self.executor.handle_obstacle()
         self._prev_obs = tel.obstacle_detected
+        if (live and self.executor.state == "BLOCKED" and self._retry_blocked_after_obstacle
+                and not tel.obstacle_detected and not self.map.sensor_obstacles
+                and not self.map.latched_sensor_obstacles and self.executor.goal):
+            self._retry_blocked_after_obstacle = False
+            self.executor.replan()
         # environment alerts
         t, s, base, high = tel.temperature_tenths / 10.0, tel.smoke_value, self.settings.smoke_baseline, self.settings.smoke_high
         flags = tel.flags
@@ -415,23 +446,17 @@ class Context:
     # ------------------------------------------------------------ commands
     def send_move(self, cmd: str, source: str = "api") -> tuple[bool, str]:
         """Single path for every movement command. Only high-level commands are ever sent. Safety rules live here."""
+        if cmd != "MOVE:STOP" and self.mode == "LIVE":
+            # Apply the same fail-closed live safety gate to executor and manual
+            # movement. STOP deliberately bypasses this gate.
+            reason = self.navigation_block_reason(check_start=(source == "executor"),
+                                                  allow_obstacle_escape=(source == "executor" and cmd in {"MOVE:LEFT", "MOVE:RIGHT"}))
+            if reason:
+                return False, reason
         if self.settings.raspberry_pi_mode:
             age = None if self.pi_last_rx is None else time.monotonic() - self.pi_last_rx
-            if age is None or age >= min(self.settings.live_timeout_s, 1.5):
+            if cmd != "MOVE:STOP" and (age is None or age >= min(self.settings.live_timeout_s, 1.5)):
                 return False, "Raspberry Pi bridge is not receiving fresh telemetry."
-            if cmd != "MOVE:STOP":
-                if source == "executor":
-                    reason = self.navigation_block_reason(check_start=False)
-                    if reason:
-                        return False, reason
-                elif self.executor.running:
-                    return False, "Stop or pause navigation before using manual recovery controls."
-                elif not self.pi_latest or self.pi_latest.flags & 0x07 or self.pi_latest.risk_score >= 75:
-                    return False, "Critical hazard or FireBird safety-stop flag is active."
-                elif cmd == "MOVE:FORWARD" and self.pi_latest.obstacle_detected:
-                    return False, "Obstacle detected (OBS:1). Forward command refused."
-                elif cmd == "MOVE:FORWARD" and self.person_count() > 0 and self.vision.safety_action == "stop":
-                    return False, "Person detected. Forward command refused (person safety action: stop)."
             ok, message = self.queue_pi_command(cmd)
             if ok:
                 self.tracker.note_sent(cmd, apply_pose=(source != "executor"), require_encoder_ack=(source == "executor"))
@@ -443,14 +468,15 @@ class Context:
             if ok:
                 self.tracker.note_sent(cmd, apply_pose=False)
             return ok, "STOP sent to FireBird." if ok else "Serial STOP write failed."
+        if cmd == "MOVE:STOP" and self.mode != "LIVE" and self.serial.is_connected():
+            # Stale telemetry must block ordinary movement, but an open serial
+            # transport can still carry the existing FireBird stop command.
+            ok = self.serial.send_command(cmd)
+            if ok:
+                self.tracker.note_sent(cmd, apply_pose=False)
+            return ok, "STOP sent to FireBird." if ok else "Serial STOP write failed."
         if source == "executor" and self.mode != "LIVE":
             return False, "Navigation commands require fresh live FireBird telemetry."
-        tel = self.telemetry()
-        if cmd == "MOVE:FORWARD":
-            if tel and tel.obstacle_detected:
-                return False, "Obstacle detected (OBS:1). Forward command refused."
-            if self.person_count() > 0 and self.vision.safety_action == "stop":
-                return False, "Person detected. Forward command refused (person safety action: stop)."
         if source != "executor" and cmd != "MOVE:STOP" and self.executor.running and not self.executor.paused:
             self.executor.pause("manual command received")
         if self.mode == "LIVE":
@@ -672,7 +698,9 @@ async def raspberry_pi_command_next(request: Request, response: Response) -> dic
     if not c.settings.raspberry_pi_mode:
         raise HTTPException(status_code=409, detail="Enable RASPBERRY_PI_MODE to use the Pi command bridge.")
     age = None if c.pi_last_rx is None else time.monotonic() - c.pi_last_rx
-    if age is None or age >= c.settings.live_timeout_s:
+    with c._pi_command_lock:
+        stop_pending = bool(c._pi_pending_command and c._pi_pending_command["command"] == "MOVE:STOP")
+    if (age is None or age >= c.settings.live_timeout_s) and not stop_pending:
         raise HTTPException(status_code=409, detail="Raspberry Pi telemetry is stale; no command is available.")
     response.headers["Cache-Control"] = "no-store"
     item = c.take_pi_command()
@@ -731,8 +759,9 @@ async def serial_autonomous(request: Request) -> dict:
     c = ctx_of(request)
     if c.settings.raspberry_pi_mode:
         raise HTTPException(status_code=409, detail="Laptop serial commands are disabled in Raspberry Pi telemetry-only mode.")
-    if c.mode != "LIVE":
-        raise HTTPException(status_code=409, detail="No live FireBird connection is receiving telemetry.")
+    reason = c.navigation_block_reason(check_start=False)
+    if reason:
+        raise HTTPException(status_code=409, detail=reason)
     if c.executor.running:
         c.executor.stop("Route stopped; returned control to FireBird autonomous avoidance")
     if not c.serial.send_autonomous():
